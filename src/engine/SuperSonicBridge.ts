@@ -27,6 +27,11 @@ interface SuperSonic {
   /** Cancel pending JS-side OSC bundles + clear scsynth WASM scheduler queue.
    *  SuperSonic blocks `/clearSched` directly; this is the documented API. */
   purge(): Promise<void>
+  /** Subscribe to server replies (`'in'` = every incoming OSC message as `[address, ...args]`).
+   *  Optional in the type because it is only needed by `loadCustomSynthDef` (#622). */
+  on?(event: string, callback: (msg: unknown[]) => void): unknown
+  /** SuperSonic's own record of definitions sent with /d_recv (filled on SEND, not on /done). */
+  loadedSynthDefs?: Map<string, Uint8Array>
   node: AudioWorkletNode
   audioContext: AudioContext
 }
@@ -138,6 +143,12 @@ export class SuperSonicBridge {
   private sonic: SuperSonic | null = null
   private loadedSynthDefs = new Set<string>()
   private pendingSynthDefLoads = new Map<string, Promise<void>>()
+  /** #622: user SynthDefs loaded with `loadCustomSynthDef`. Their names are used as-is
+   *  (no `sonic-pi-` prefix) and never fetched from the CDN. */
+  private customSynthDefs = new Set<string>()
+  /** #622: custom loads run one at a time so each /sync reply is unambiguous. */
+  private customLoadChain: Promise<unknown> = Promise.resolve()
+  private customSyncId = 0x5e1f0000
   private loadedSamples = new Map<string, number>()
   private pendingSampleLoads = new Map<string, Promise<number>>()
   /** Sample duration cache — populated asynchronously on first load via Web Audio decode. */
@@ -676,8 +687,72 @@ export class SuperSonicBridge {
     return this.ensureSynthDefLoaded(`sonic-pi-fx_${name}`)
   }
 
+  /** Built-in synths live under `sonic-pi-`; a custom SynthDef (#622) keeps its own name. */
+  private synthDefName(name: string): string {
+    if (this.customSynthDefs.has(name)) return name
+    return name.startsWith('sonic-pi-') ? name : `sonic-pi-${name}`
+  }
+
+  /** True once `name` was loaded with `loadCustomSynthDef` and the server accepted it. */
+  isCustomSynthDef(name: string): boolean {
+    return this.customSynthDefs.has(name)
+  }
+
+  /**
+   * #622: load user SynthDef bytes and wait for the SERVER's verdict.
+   *
+   * SuperSonic marks a definition as loaded the moment it is sent (its `loadedSynthDefs`
+   * fills on send), so a file the server rejects still looks loaded. Here we send
+   * `/d_recv` then `/sync id`; scsynth runs asynchronous commands in order, so `/synced id`
+   * arrives only after the `/d_recv` has finished. A `/fail /d_recv` seen in between means
+   * the server refused it. The caller is expected to have run `checkSynthDefFile` first —
+   * the server does not check graph wiring.
+   *
+   * `names` are the SynthDef names inside `bytes` (from the decoder); they become playable
+   * by `synth :name` only after the server accepts the file.
+   */
+  loadCustomSynthDef(bytes: Uint8Array, names: string[], timeoutMs = 5000): Promise<void> {
+    const run = () => new Promise<void>((resolve, reject) => {
+      const sonic = this.sonic
+      if (!sonic) return reject(new Error('the audio engine is not running'))
+      if (typeof sonic.on !== 'function') return reject(new Error('this SuperSonic build cannot report load results'))
+      const id = ++this.customSyncId
+      let failure: string | null = null
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let off: unknown
+      const finish = (err?: Error) => {
+        if (timer) clearTimeout(timer)
+        if (typeof off === 'function') (off as () => void)()
+        if (err) reject(err)
+        else resolve()
+      }
+      off = sonic.on('in', (msg: unknown[]) => {
+        if (!Array.isArray(msg)) return
+        if (msg[0] === '/fail' && msg[1] === '/d_recv') failure = msg.slice(2).map(String).join(' ')
+        if (msg[0] === '/synced' && msg[1] === id) {
+          if (failure) {
+            // Keep SuperSonic's reload() from re-sending a file the server refused.
+            for (const n of names) sonic.loadedSynthDefs?.delete(n)
+            finish(new Error(`the audio engine refused it: ${failure}`))
+          } else finish()
+        }
+      })
+      timer = setTimeout(() => finish(new Error(`no reply from the audio engine after ${timeoutMs / 1000} s`)), timeoutMs)
+      sonic.send('/d_recv', bytes)
+      sonic.send('/sync', id)
+    })
+    const p = this.customLoadChain.then(run, run)
+    this.customLoadChain = p.catch(() => { /* the next load runs regardless */ })
+    return p.then(() => {
+      for (const n of names) {
+        this.customSynthDefs.add(n)
+        this.loadedSynthDefs.add(n)
+      }
+    })
+  }
+
   private ensureSynthDefLoaded(name: string): Promise<void> {
-    const fullName = name.startsWith('sonic-pi-') ? name : `sonic-pi-${name}`
+    const fullName = this.synthDefName(name)
     if (this.loadedSynthDefs.has(fullName)) return Promise.resolve()
     // Return existing in-flight promise to avoid duplicate loads
     const pending = this.pendingSynthDefLoads.get(fullName)
@@ -817,7 +892,7 @@ export class SuperSonicBridge {
   ): Promise<number> {
     if (!this.sonic) throw new Error('SuperSonic not initialized')
 
-    const fullName = synthName.startsWith('sonic-pi-') ? synthName : `sonic-pi-${synthName}`
+    const fullName = this.synthDefName(synthName)
 
     // Fast path: synthdef already loaded — skip async entirely
     if (this.loadedSynthDefs.has(fullName)) {
@@ -1717,6 +1792,7 @@ export class SuperSonicBridge {
       this.sonic = null
     }
     this.loadedSynthDefs.clear()
+    this.customSynthDefs.clear()
     this.loadedSamples.clear()
     this.sampleDurations.clear()
     this.sampleChannels.clear()

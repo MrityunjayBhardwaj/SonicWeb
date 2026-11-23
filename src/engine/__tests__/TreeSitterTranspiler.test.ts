@@ -2850,3 +2850,20 @@ describe('#484/SP130 — __run_once wrap gate is structural (bare DSL reaching t
     })
   })
 })
+
+describe('#622: load_synthdef is handled before Run, so the call transpiles to nothing', () => {
+  beforeAll(async () => {
+    expect(await initTreeSitter({ treeSitterWasmUrl: tsWasm, rubyWasmUrl: rubyWasm })).toBe(true)
+  })
+  it('emits no runtime call for load_synthdef / load_synthdefs, top-level or in a loop', () => {
+    for (const src of [
+      'load_synthdef "https://example.com/web_bass.scsyndef"\nsynth :web_bass, note: 40',
+      'load_synthdefs "~/synths"\nplay 60',
+      'live_loop :a do\n  load_synthdef "x.scsyndef"\n  sleep 1\nend',
+    ]) {
+      const js = autoTranspile(src)
+      expect(js).not.toMatch(/load_synthdefs?\s*\(/)
+      expect(js).toContain('load_synthdef: loaded before Run')
+    }
+  })
+})

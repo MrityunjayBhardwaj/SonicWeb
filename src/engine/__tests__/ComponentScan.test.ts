@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { scanComponentNames } from '../ComponentScan'
+import { scanComponentNames, scanSynthDefLoads } from '../ComponentScan'
 
 const s = (code: string) => {
   const m = scanComponentNames(code)
@@ -109,5 +109,25 @@ describe('scanComponentNames (#318.3 / #323 static extractor)', () => {
   it('empty / component-free code yields empty sets', () => {
     expect(s('play 60\nsleep 1')).toEqual({ samples: [], fx: [], synths: [] })
     expect(s('')).toEqual({ samples: [], fx: [], synths: [] })
+  })
+})
+
+describe('scanSynthDefLoads (#622)', () => {
+  it('collects literal URLs in source order, de-duplicated, ignoring comments', () => {
+    const code = `
+      load_synthdef "https://a.example/one.scsyndef"
+      load_synthdef('two.scsyndef')
+      # load_synthdef "commented-out.scsyndef"
+      load_synthdef "https://a.example/one.scsyndef"
+      synth :one
+    `
+    expect(scanSynthDefLoads(code)).toEqual({ urls: ['https://a.example/one.scsyndef', 'two.scsyndef'], dynamic: 0, folders: 0 })
+  })
+  it('counts computed URLs and folder loads instead of guessing', () => {
+    const code = 'base = "x"\nload_synthdef base\nload_synthdef "#{base}/y.scsyndef"\nload_synthdefs "~/synths"'
+    expect(scanSynthDefLoads(code)).toEqual({ urls: [], dynamic: 2, folders: 1 })
+  })
+  it('finds nothing in code without load_synthdef', () => {
+    expect(scanSynthDefLoads('use_synth :saw\nplay 60')).toEqual({ urls: [], dynamic: 0, folders: 0 })
   })
 })

@@ -101,3 +101,40 @@ export function scanComponentNames(code: string): ComponentManifest {
   }
   return manifest
 }
+
+/**
+ * #622: `load_synthdef "<url>"` calls, found the same way as component names (literal,
+ * comments stripped) so the pre-Run step can fetch, check and load each SynthDef BEFORE
+ * the component preflight sees `synth :name` — otherwise the preflight would refuse Run
+ * for a custom synth it cannot find on the CDN.
+ *
+ * `urls`     literal string arguments, in source order, de-duplicated.
+ * `dynamic`  calls whose argument is not a string literal (can't be known before Run).
+ * `folders`  `load_synthdefs` calls — desktop loads a whole directory; the browser has none.
+ */
+export interface SynthDefLoadScan {
+  urls: string[]
+  dynamic: number
+  folders: number
+}
+
+export function scanSynthDefLoads(code: string): SynthDefLoadScan {
+  const src = stripComments(code)
+  const urls: string[] = []
+  let dynamic = 0
+  let folders = 0
+  const call = /\bload_synthdef(s?)\b\s*\(?\s*(.?)/g
+  let m: RegExpExecArray | null
+  while ((m = call.exec(src)) !== null) {
+    if (m[1] === 's') { folders++; continue }
+    const q = m[2]
+    if (q !== '"' && q !== "'") { dynamic++; continue }
+    const start = m.index + m[0].length
+    const end = src.indexOf(q, start)
+    if (end < 0) { dynamic++; continue }
+    const url = src.slice(start, end)
+    if (q === '"' && url.includes('#{')) { dynamic++; continue } // Ruby interpolation
+    if (!urls.includes(url)) urls.push(url)
+  }
+  return { urls, dynamic, folders }
+}
