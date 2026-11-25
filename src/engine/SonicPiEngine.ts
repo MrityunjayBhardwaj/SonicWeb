@@ -33,7 +33,8 @@ const CLAMP_WARN_RE = /clamped to .+ \((min|max)\)$/
  *  miss. 5s is well past a healthy unpkg fetch, short enough to feel. */
 const PREFLIGHT_TIMEOUT_MS = 5000
 import { friendlyError, formatFriendlyError, type FriendlyError } from './FriendlyErrors'
-import { scanComponentNames } from './ComponentScan'
+import { scanComponentNames, scanSynthDefLoads } from './ComponentScan'
+import { checkSynthDefFile } from './SynthDefFile'
 import { resolveComponentManifest } from './ComponentResolver'
 import { detectStratum, Stratum } from './Stratum'
 import { SoundEventStream } from './SoundEventStream'
@@ -153,6 +154,8 @@ export class SonicPiEngine {
    * offending value, or want to be told again because they re-pressed Run).
    */
   private warnDedup = new Set<string>()
+  /** #622: `load_synthdef` URL → SynthDef names it defined, so an unchanged URL isn't re-fetched every Run. */
+  private synthDefUrlNames = new Map<string, string[]>()
   private currentCode = ''
   private currentStratum: Stratum = Stratum.S1
   private bridgeOptions: SuperSonicBridgeOptions
@@ -524,6 +527,42 @@ export class SonicPiEngine {
    * Does NOT throw — check the return value. Runtime errors inside `live_loop`
    * bodies after the scheduler has started are delivered via `setRuntimeErrorHandler`.
    */
+  /**
+   * #622: load a user SynthDef (the web counterpart of desktop Sonic Pi's `load_synthdef`).
+   * `source` is a URL to a compiled `.scsyndef` file, or its bytes. The file is decoded and
+   * checked (`checkSynthDefFile`) BEFORE it reaches the audio server — the server does not
+   * check graph wiring — and the promise resolves only after the server itself accepts it.
+   * Afterwards `synth :name` / `use_synth :name` play it. Rejects with every problem found.
+   */
+  async loadSynthDef(source: string | Uint8Array | ArrayBuffer): Promise<{ names: string[]; warnings: string[]; bytes: number }> {
+    if (!this.bridge) throw new Error('the audio engine is not running yet')
+    let bytes: Uint8Array
+    const label = typeof source === 'string' ? source : 'SynthDef bytes'
+    if (typeof source === 'string') {
+      let res: Response
+      try {
+        res = await fetch(source)
+      } catch (e) {
+        throw new Error(`couldn't download ${source} (${e instanceof Error ? e.message : String(e)}). The server must allow cross-origin requests (CORS).`)
+      }
+      if (!res.ok) throw new Error(`couldn't download ${source} (HTTP ${res.status})`)
+      bytes = new Uint8Array(await res.arrayBuffer())
+    } else {
+      bytes = source instanceof Uint8Array ? source : new Uint8Array(source)
+    }
+    const check = checkSynthDefFile(bytes)
+    if (check.errors.length > 0 || !check.file) {
+      throw new Error(`${label} can't be loaded:\n  - ${check.errors.join('\n  - ')}`)
+    }
+    const names = check.file.defs.map((d) => d.name)
+    try {
+      await this.bridge.loadCustomSynthDef(bytes, names)
+    } catch (e) {
+      throw new Error(`${label}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    return { names, warnings: check.warnings, bytes: bytes.byteLength }
+  }
+
   async evaluate(code: string): Promise<{ error?: Error }> {
     if (!this.initialized) {
       return { error: new Error('SonicPiEngine not initialized — call init() first') }
@@ -569,6 +608,35 @@ export class SonicPiEngine {
           if (seen.has(key)) continue
           seen.add(key)
           this.warningHandler(w.title, w.message)
+        }
+      }
+
+      // #622: `load_synthdef "<url>"` — fetch, check and load each literal URL NOW, before
+      // the component preflight below looks for `synth :name` (it would refuse Run for a
+      // custom name it can't find on the CDN), and before any loop can play it. Runs on
+      // hot-swap too, so adding a load_synthdef line while playing works. Unchanged URLs
+      // whose synths the server still holds are skipped.
+      {
+        const loads = scanSynthDefLoads(code)
+        if (this.warningHandler) {
+          if (loads.folders > 0) {
+            this.warningHandler('load_synthdefs', 'Loading a whole folder isn\'t possible in the browser. Use load_synthdef "<url>" once per .scsyndef file.')
+          }
+          if (loads.dynamic > 0) {
+            this.warningHandler('load_synthdef', 'load_synthdef needs a URL written as a string, like load_synthdef "https://…/my_synth.scsyndef". Calls with a computed URL are skipped.')
+          }
+        }
+        for (const url of loads.urls) {
+          const known = this.synthDefUrlNames.get(url)
+          if (known && known.every((n) => this.bridge?.isCustomSynthDef(n))) continue
+          try {
+            const { names, warnings } = await this.loadSynthDef(url)
+            this.synthDefUrlNames.set(url, names)
+            if (this.printHandler) this.printHandler(`load_synthdef: loaded ${names.map((n) => ':' + n).join(', ')}`)
+            for (const w of warnings) this.warningHandler?.('load_synthdef', w)
+          } catch (e) {
+            return { error: e instanceof Error ? e : new Error(String(e)) }
+          }
         }
       }
 

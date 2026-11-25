@@ -466,6 +466,10 @@ const TOP_LEVEL_SCOPE = new Set([
  */
 const UNIMPLEMENTED_DSL = new Set([
   'load_samples', 'load_sample',
+  // #622: the engine loads literal `load_synthdef "<url>"` files BEFORE Run
+  // (SonicPiEngine.evaluate → loadSynthDef), so at run time the call has nothing
+  // left to do. `load_synthdefs` (a folder) has no browser form; evaluate warns.
+  'load_synthdef', 'load_synthdefs',
 ])
 
 /**
@@ -1806,6 +1810,10 @@ function transpileMethodCall(node: any, ctx: TranspileContext): string {
     // load_samples / load_sample — no-op
     if (methodName === 'load_samples' || methodName === 'load_sample') {
       return '/* load_samples: no-op in browser */'
+    }
+    // load_synthdef(s) — loaded before Run by the engine (#622)
+    if (methodName === 'load_synthdef' || methodName === 'load_synthdefs') {
+      return '/* load_synthdef: loaded before Run */'
     }
 
     // osc_send — emit to host-provided handler

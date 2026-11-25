@@ -32,21 +32,29 @@ import { resolveSynthName } from './SoundLayer'
 /**
  * Strip Ruby comments so a commented-out `sample :typo` cannot false-block
  * Run. Handles line comments (`#` … EOL) and `=begin`/`=end` block
- * comments. Known v1 limit: a `#` inside a string literal on a line with
- * no real comment will truncate that line early — acceptable because the
- * DSL forms we scan (`sample :x` etc.) do not use `#` in their literal
- * name, and the failure mode is under-collection of that one line, which
- * degrades to lazy-load (no false-block, no regression). `#{}`
- * interpolation is preserved (only `#` NOT followed by `{` starts a
- * comment here).
+ * comments. A `#` inside a `"…"` or `'…'` string (backslash escapes
+ * respected) is NOT a comment — `load_synthdef` URLs routinely carry one
+ * (`…/bass.scsyndef#v2`, #624), and `"#{x}"` interpolation lives there too.
+ * Strings are tracked per line: one left open at end of line keeps the
+ * rest of that line (over-collection is harmless; a false comment cut is
+ * not). Not handled: `%q()`-style literals and heredocs.
  */
 function stripComments(code: string): string {
   const withoutBlocks = code.replace(/^=begin\b[\s\S]*?^=end\b.*$/gm, '')
   return withoutBlocks
     .split('\n')
     .map((line) => {
+      let quote: string | null = null
       for (let i = 0; i < line.length; i++) {
-        if (line[i] === '#' && line[i + 1] !== '{') return line.slice(0, i)
+        const c = line[i]
+        if (quote) {
+          if (c === '\\') i++ // skip the escaped character
+          else if (c === quote) quote = null
+        } else if (c === '"' || c === "'") {
+          quote = c
+        } else if (c === '#') {
+          return line.slice(0, i)
+        }
       }
       return line
     })
@@ -100,4 +108,41 @@ export function scanComponentNames(code: string): ComponentManifest {
     }
   }
   return manifest
+}
+
+/**
+ * #622: `load_synthdef "<url>"` calls, found the same way as component names (literal,
+ * comments stripped) so the pre-Run step can fetch, check and load each SynthDef BEFORE
+ * the component preflight sees `synth :name` — otherwise the preflight would refuse Run
+ * for a custom synth it cannot find on the CDN.
+ *
+ * `urls`     literal string arguments, in source order, de-duplicated.
+ * `dynamic`  calls whose argument is not a string literal (can't be known before Run).
+ * `folders`  `load_synthdefs` calls — desktop loads a whole directory; the browser has none.
+ */
+export interface SynthDefLoadScan {
+  urls: string[]
+  dynamic: number
+  folders: number
+}
+
+export function scanSynthDefLoads(code: string): SynthDefLoadScan {
+  const src = stripComments(code)
+  const urls: string[] = []
+  let dynamic = 0
+  let folders = 0
+  const call = /\bload_synthdef(s?)\b\s*\(?\s*(.?)/g
+  let m: RegExpExecArray | null
+  while ((m = call.exec(src)) !== null) {
+    if (m[1] === 's') { folders++; continue }
+    const q = m[2]
+    if (q !== '"' && q !== "'") { dynamic++; continue }
+    const start = m.index + m[0].length
+    const end = src.indexOf(q, start)
+    if (end < 0) { dynamic++; continue }
+    const url = src.slice(start, end)
+    if (q === '"' && url.includes('#{')) { dynamic++; continue } // Ruby interpolation
+    if (!urls.includes(url)) urls.push(url)
+  }
+  return { urls, dynamic, folders }
 }

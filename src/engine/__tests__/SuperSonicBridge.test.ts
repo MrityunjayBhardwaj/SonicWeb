@@ -569,3 +569,79 @@ describe('SuperSonicBridge', () => {
     })
   })
 })
+
+describe('SuperSonicBridge custom SynthDefs (#622)', () => {
+  /** Mock whose `on('in')` lets the test play the server's replies. */
+  async function setup(reply: (address: string, args: unknown[], emit: (m: unknown[]) => void) => void) {
+    const { mockSonic, sent, bundles } = createMockSuperSonic()
+    const listeners: Array<(m: unknown[]) => void> = []
+    const emit = (m: unknown[]) => listeners.slice().forEach((l) => l(m))
+    const m = mockSonic as typeof mockSonic & { on: unknown; loadedSynthDefs: Map<string, unknown> }
+    m.loadedSynthDefs = new Map()
+    m.on = vi.fn((_ev: string, cb: (m: unknown[]) => void) => {
+      listeners.push(cb)
+      return () => listeners.splice(listeners.indexOf(cb), 1)
+    })
+    const baseSend = mockSonic.send
+    m.send = vi.fn((address: string, ...args: (string | number)[]) => {
+      baseSend(address, ...args)
+      if (address === '/d_recv') m.loadedSynthDefs.set('web_bass', args[0]) // SuperSonic fills this on SEND
+      queueMicrotask(() => reply(address, args, emit))
+    })
+    ;(globalThis as Record<string, unknown>).SuperSonic = vi.fn(() => mockSonic)
+    const bridge = new SuperSonicBridge()
+    await bridge.init()
+    return { bridge, mockSonic: m, sent, bundles, listeners }
+  }
+  const okServer = (address: string, args: unknown[], emit: (m: unknown[]) => void) => {
+    if (address === '/d_recv') emit(['/done', '/d_recv'])
+    if (address === '/sync') emit(['/synced', args[0]])
+  }
+
+  it('resolves only after the server confirms, then plays the name WITHOUT the sonic-pi- prefix', async () => {
+    const { bridge, mockSonic, bundles } = await setup(okServer)
+    expect(bridge.isCustomSynthDef('web_bass')).toBe(false)
+    await bridge.loadCustomSynthDef(new Uint8Array([1, 2, 3]), ['web_bass'])
+    expect(bridge.isCustomSynthDef('web_bass')).toBe(true)
+    // preflight path: preloadSynth must NOT try the CDN for a custom name
+    await bridge.preloadSynth('web_bass')
+    expect(mockSonic.loadSynthDef).not.toHaveBeenCalledWith('sonic-pi-web_bass')
+    await bridge.triggerSynth('web_bass', 0, { note: 40 })
+    bridge.flushMessages()
+    const raw = new TextDecoder('latin1').decode(bundles[bundles.length - 1])
+    expect(raw).toContain('web_bass')
+    expect(raw).not.toContain('sonic-pi-web_bass')
+  })
+
+  it('rejects when the server answers /fail, and does not register the name', async () => {
+    const { bridge, mockSonic } = await setup((address, args, emit) => {
+      if (address === '/d_recv') emit(['/fail', '/d_recv', "UGen 'MouseX' not installed."])
+      if (address === '/sync') emit(['/synced', args[0]])
+    })
+    await expect(bridge.loadCustomSynthDef(new Uint8Array([1]), ['web_bass'])).rejects.toThrow(/refused it: UGen 'MouseX' not installed/)
+    expect(bridge.isCustomSynthDef('web_bass')).toBe(false)
+    // SuperSonic's own record (filled on send) is cleaned so its reload() won't re-send it
+    expect(mockSonic.loadedSynthDefs.has('web_bass')).toBe(false)
+  })
+
+  it('ignores another load’s /done and waits for its own /sync reply', async () => {
+    let release: () => void = () => {}
+    const { bridge } = await setup((address, args, emit) => {
+      if (address === '/d_recv') emit(['/done', '/d_recv']) // could be anyone's
+      if (address === '/sync') release = () => emit(['/synced', args[0]])
+    })
+    let settled = false
+    const p = bridge.loadCustomSynthDef(new Uint8Array([1]), ['web_bass']).then(() => { settled = true })
+    await new Promise((r) => setTimeout(r, 10))
+    expect(settled).toBe(false)
+    release()
+    await p
+    expect(settled).toBe(true)
+  })
+
+  it('times out with a readable error when the server never answers', async () => {
+    const { bridge } = await setup(() => { /* silence */ })
+    await expect(bridge.loadCustomSynthDef(new Uint8Array([1]), ['web_bass'], 30)).rejects.toThrow(/no reply/)
+    expect(bridge.isCustomSynthDef('web_bass')).toBe(false)
+  })
+})
