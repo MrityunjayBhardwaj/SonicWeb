@@ -65,6 +65,16 @@ describe('scanComponentNames (#318.3 / #323 static extractor)', () => {
     expect(s('with_fx :echo do\n  play "#{note}"\nend').fx).toEqual(['echo'])
   })
 
+  it('a # inside a string does not hide a reference after it (#624)', () => {
+    expect(s('puts "step #1"; sample :bd_haus').samples).toEqual(['bd_haus'])
+    expect(s("puts 'a # b'; with_fx :echo do\nend").fx).toEqual(['echo'])
+    // …but a real comment after such a string is still a comment.
+    expect(s('puts "#1" # sample :ghost').samples).toEqual([])
+    // An escaped quote does not end the string, so the # after it is still inside.
+    expect(s('puts "a\\"#b"; sample :bd_haus').samples).toEqual(['bd_haus'])
+    expect(s("puts 'it\\'s #1'; sample :bd_haus").samples).toEqual(['bd_haus'])
+  })
+
   it('does NOT collect runtime-computed names (bounded by design)', () => {
     const r = s('use_synth SYNTHS.tick\nsample samps.choose\nwith_fx fx_name')
     expect(r).toEqual({ samples: [], fx: [], synths: [] })
@@ -126,6 +136,20 @@ describe('scanSynthDefLoads (#622)', () => {
   it('counts computed URLs and folder loads instead of guessing', () => {
     const code = 'base = "x"\nload_synthdef base\nload_synthdef "#{base}/y.scsyndef"\nload_synthdefs "~/synths"'
     expect(scanSynthDefLoads(code)).toEqual({ urls: [], dynamic: 2, folders: 1 })
+  })
+  it('keeps a # inside the URL string (#624) — it is not a comment', () => {
+    expect(scanSynthDefLoads('load_synthdef "https://ex.com/web_bass.scsyndef#v2"').urls).toEqual([
+      'https://ex.com/web_bass.scsyndef#v2',
+    ])
+    expect(scanSynthDefLoads("load_synthdef 'https://ex.com/a.scsyndef#x' # load_synthdef 'ghost'").urls).toEqual([
+      'https://ex.com/a.scsyndef#x',
+    ])
+  })
+  it('still strips a real comment after a quoted string that contains #', () => {
+    // The trailing comment holds a second call; it must not be collected.
+    expect(scanSynthDefLoads('load_synthdef "a#b.scsyndef" # load_synthdef "c.scsyndef"')).toEqual({
+      urls: ['a#b.scsyndef'], dynamic: 0, folders: 0,
+    })
   })
   it('finds nothing in code without load_synthdef', () => {
     expect(scanSynthDefLoads('use_synth :saw\nplay 60')).toEqual({ urls: [], dynamic: 0, folders: 0 })

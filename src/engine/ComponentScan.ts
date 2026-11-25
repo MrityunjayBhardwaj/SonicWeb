@@ -32,21 +32,29 @@ import { resolveSynthName } from './SoundLayer'
 /**
  * Strip Ruby comments so a commented-out `sample :typo` cannot false-block
  * Run. Handles line comments (`#` … EOL) and `=begin`/`=end` block
- * comments. Known v1 limit: a `#` inside a string literal on a line with
- * no real comment will truncate that line early — acceptable because the
- * DSL forms we scan (`sample :x` etc.) do not use `#` in their literal
- * name, and the failure mode is under-collection of that one line, which
- * degrades to lazy-load (no false-block, no regression). `#{}`
- * interpolation is preserved (only `#` NOT followed by `{` starts a
- * comment here).
+ * comments. A `#` inside a `"…"` or `'…'` string (backslash escapes
+ * respected) is NOT a comment — `load_synthdef` URLs routinely carry one
+ * (`…/bass.scsyndef#v2`, #624), and `"#{x}"` interpolation lives there too.
+ * Strings are tracked per line: one left open at end of line keeps the
+ * rest of that line (over-collection is harmless; a false comment cut is
+ * not). Not handled: `%q()`-style literals and heredocs.
  */
 function stripComments(code: string): string {
   const withoutBlocks = code.replace(/^=begin\b[\s\S]*?^=end\b.*$/gm, '')
   return withoutBlocks
     .split('\n')
     .map((line) => {
+      let quote: string | null = null
       for (let i = 0; i < line.length; i++) {
-        if (line[i] === '#' && line[i + 1] !== '{') return line.slice(0, i)
+        const c = line[i]
+        if (quote) {
+          if (c === '\\') i++ // skip the escaped character
+          else if (c === quote) quote = null
+        } else if (c === '"' || c === "'") {
+          quote = c
+        } else if (c === '#') {
+          return line.slice(0, i)
+        }
       }
       return line
     })
